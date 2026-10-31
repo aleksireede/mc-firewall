@@ -53,6 +53,9 @@ sudo python3 mc-firewall.py --port 25566
 # Add a second blocklist (URL) and a local file of your own
 sudo python3 mc-firewall.py --secondary https://example.com/list.txt --secondary my-ips.txt
 
+# Different primary list
+sudo python3 mc-firewall.py --url https://gitlab.com/-/snippets/6073805/raw/main/snippetfile1.txt
+
 # Make sure your home network is never blocked
 sudo python3 mc-firewall.py --allow 203.0.113.0/24
 
