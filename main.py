@@ -1,5 +1,22 @@
+#!/usr/bin/env python3
+"""Block Minescan scanner IPs from reaching a Minecraft server port.
+
+Downloads the Minescan feed (IPs and/or CIDR ranges) and installs a drop rule
+for the given TCP port using nftables or ipset+iptables (Linux), pf (macOS)
+or Windows Firewall.
+
+The script is idempotent: re-running it (cron / systemd timer) replaces the
+block list in place without duplicating rules.
+
+Examples:
+    sudo ./mc-firewall.py --dry-run
+    sudo ./mc-firewall.py --port 25565 --allow 203.0.113.0/24
+    sudo ./mc-firewall.py --secondary https://example.com/list.txt --secondary extra.txt
+    sudo ./mc-firewall.py --remove
+"""
+from __future__ import annotations
+
 import argparse
-import ctypes
 import ipaddress
 import os
 import platform
@@ -7,22 +24,35 @@ import shutil
 import subprocess
 import sys
 import urllib.request
+from urllib.error import URLError
 
 DEFAULT_URL = "https://data.minescan.xyz/scanners/export?format=ip&includeMinescan=true"
 DEFAULT_PORT = 25565
-SET_NAME = "minescan_blocklist"
-RULE_NAME = "MinescanBlocklist"
+USER_AGENT = "mc-firewall/2.0"
+
+SET_NAME = "minescan_blocklist"   # ipset base name (suffixed _v4 / _v6)
+NFT_TABLE = "minescan_filter"
+PF_ANCHOR = "minescan"
+RULE_NAME = "MinescanBlocklist"   # Windows rule prefix
+
+MAX_FEED_BYTES = 50 * 1024 * 1024
+IPSET_MAXELEM = 1_000_000
+WIN_BATCH = 500
+# Safety net against a broken/poisoned feed blocking half the internet.
+MIN_PREFIX = {4: 16, 6: 32}
 
 
+# --------------------------------------------------------------------------- #
+# helpers
+# --------------------------------------------------------------------------- #
 def is_admin() -> bool:
-    system = platform.system()
-    if system == "Windows":
+    if platform.system() == "Windows":
+        import ctypes
         try:
             return ctypes.windll.shell32.IsUserAnAdmin() != 0
         except Exception:
             return False
-    else:
-        return os.geteuid() == 0
+    return os.geteuid() == 0
 
 
 def which(cmd: str) -> bool:
@@ -30,12 +60,7 @@ def which(cmd: str) -> bool:
 
 
 def run(cmd, input_text=None, check=True):
-    result = subprocess.run(
-        cmd,
-        input=input_text,
-        text=True,
-        capture_output=True,
-    )
+    result = subprocess.run(cmd, input=input_text, text=True, capture_output=True)
     if check and result.returncode != 0:
         raise RuntimeError(
             f"Command failed: {' '.join(cmd)}\n"
@@ -44,229 +69,301 @@ def run(cmd, input_text=None, check=True):
     return result
 
 
-def fetch_ip_list(url: str) -> list[str]:
-    print(f"[*] Downloading IP list from {url} ...")
-    req = urllib.request.Request(url, headers={"User-Agent": "block-minescan-ips/1.0"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        raw = resp.read().decode("utf-8", errors="ignore")
+def write_file(path: str, text: str):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
 
-    ips = []
+
+def parse_feed(raw: str, allow: list) -> tuple[dict, int]:
+    """Return ({4: [nets], 6: [nets]}, skipped_count). Accepts IPs and CIDRs."""
+    found = {4: [], 6: []}
+    skipped = 0
     for line in raw.splitlines():
-        line = line.strip()
+        line = line.split("#", 1)[0].strip()
         if not line:
             continue
         try:
-            ipaddress.ip_address(line)
-            ips.append(line)
+            net = ipaddress.ip_network(line, strict=False)
         except ValueError:
+            skipped += 1
             continue
+        if (
+            not net.network_address.is_global          # private, loopback, etc.
+            or net.prefixlen < MIN_PREFIX[net.version]  # suspiciously huge range
+            or any(net.version == a.version and net.overlaps(a) for a in allow)
+        ):
+            skipped += 1
+            continue
+        found[net.version].append(net)
 
-    if not ips:
-        raise RuntimeError("No valid IP addresses found in the downloaded feed.")
-
-    print(f"[*] Parsed {len(ips)} valid IP addresses.")
-    return ips
-
-
-def block_linux_nft(ips: list[str], port: int):
-    print("[*] Using nftables backend.")
-    table = "inet minescan_filter"
-
-    run(["nft", "add", "table", "inet", "minescan_filter"], check=False)
-    run(["nft", "add", "set", "inet", "minescan_filter", SET_NAME,
-         "{ type ipv4_addr; flags interval; }"], check=False)
-    run(["nft", "flush", "set", "inet", "minescan_filter", SET_NAME])
-
-    elements = ", ".join(ips)
-    run(["nft", "add", "element", "inet", "minescan_filter", SET_NAME,
-         "{ " + elements + " }"])
-
-    run(["nft", "add", "chain", "inet", "minescan_filter", "input",
-     "{ type filter hook input priority 0; policy accept; }"], check=False)
-
-    run(["nft", "flush", "chain", "inet", "minescan_filter", "input"], check=False)
-
-    run(["nft", "add", "rule", "inet", "minescan_filter", "input",
-         "tcp", "dport", str(port), "ip", "saddr", f"@{SET_NAME}", "drop"])
-
-    print(f"[+] nftables set '{SET_NAME}' updated with {len(ips)} IPs; "
-          f"drop rule active on tcp/{port}.")
-    print("    Note: for persistence across reboots, save your ruleset "
-          "(e.g. `nft list ruleset > /etc/nftables.conf`) and enable the "
-          "nftables service.")
+    return found, skipped
 
 
-def block_linux_ipset(ips: list[str], port: int):
-    print("[*] Using ipset + iptables backend.")
-    tmp_set = f"{SET_NAME}_tmp"
-
-    run(["ipset", "create", SET_NAME, "hash:ip", "maxelem", "65536"], check=False)
-    run(["ipset", "create", tmp_set, "hash:ip", "maxelem", "65536", "-exist"])
-    run(["ipset", "flush", tmp_set])
-
-    for ip in ips:
-        run(["ipset", "add", tmp_set, ip, "-exist"])
-
-    run(["ipset", "swap", tmp_set, SET_NAME])
-    run(["ipset", "destroy", tmp_set])
-
-    check = run(["iptables", "-C", "INPUT", "-p", "tcp", "--dport", str(port),
-                 "-m", "set", "--match-set", SET_NAME, "src", "-j", "DROP"], check=False)
-    if check.returncode != 0:
-        run(["iptables", "-I", "INPUT", "-p", "tcp", "--dport", str(port),
-             "-m", "set", "--match-set", SET_NAME, "src", "-j", "DROP"])
-
-    print(f"[+] ipset '{SET_NAME}' updated with {len(ips)} IPs; "
-          f"iptables DROP rule active on tcp/{port}.")
-    print("    Note: for persistence, use `iptables-save` / the "
-          "netfilter-persistent package (Debian/Ubuntu) or equivalent.")
-
-
-def block_linux_firewalld(ips: list[str], port: int):
-    print("[*] Using firewalld backend.")
-    run(["firewall-cmd", "--permanent", "--new-ipset=" + SET_NAME,
-         "--type=hash:ip"], check=False)
-    run(["firewall-cmd", "--permanent", "--ipset=" + SET_NAME, "--add-entries="])
-
-    existing = run(["firewall-cmd", "--permanent", "--ipset=" + SET_NAME, "--get-entries"],
-                    check=False).stdout.split()
-    if existing:
-        run(["firewall-cmd", "--permanent", "--ipset=" + SET_NAME,
-             "--remove-entries=" + ",".join(existing)], check=False)
-
-    run(["firewall-cmd", "--permanent", "--ipset=" + SET_NAME,
-         "--add-entries=" + ",".join(ips)])
-
-    rule = (f'rule family="ipv4" source ipset="{SET_NAME}" '
-            f'port protocol="tcp" port="{port}" drop')
-    run(["firewall-cmd", "--permanent", "--add-rich-rule=" + rule], check=False)
-    run(["firewall-cmd", "--reload"])
-
-    print(f"[+] firewalld ipset '{SET_NAME}' updated with {len(ips)} IPs; "
-          f"drop rule active on tcp/{port}.")
-
-
-def block_linux_ufw(ips: list[str], port: int):
-    print("[*] Using ufw backend (no native large-set support; adding rules directly "
-          "via the underlying iptables/ipset instead, since ufw doesn't natively "
-          "support bulk address sets).")
-    block_linux_ipset(ips, port)
-    print("    Note: since this bypasses ufw's own rule files, re-running "
-          "`ufw reload` or `ufw enable` will NOT remove it, but managing it "
-          "via ufw commands directly isn't supported for large IP sets.")
-
-
-def block_linux(ips: list[str], port: int):
-    if which("nft"):
-        block_linux_nft(ips, port)
-    elif which("ipset") and which("iptables"):
-        block_linux_ipset(ips, port)
-    elif which("firewall-cmd"):
-        block_linux_firewalld(ips, port)
-    elif which("ufw"):
-        block_linux_ufw(ips, port)
+def read_source(src: str) -> str:
+    """Read a feed from a local file or an http(s) URL."""
+    if os.path.isfile(src):
+        with open(src, "rb") as f:
+            raw = f.read(MAX_FEED_BYTES + 1)
     else:
-        raise RuntimeError(
-            "No supported firewall tool found (nft, ipset+iptables, "
-            "firewalld, or ufw). Install one of these first."
-        )
+        if not src.lower().startswith(("http://", "https://")):
+            raise RuntimeError(f"'{src}' is neither an existing file nor an http(s) URL")
+        req = urllib.request.Request(src, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read(MAX_FEED_BYTES + 1)
+    if len(raw) > MAX_FEED_BYTES:
+        raise RuntimeError(f"{src} is unreasonably large; refusing to process it.")
+    return raw.decode("utf-8", errors="ignore")
 
 
-def block_macos_pf(ips: list[str], port: int):
-    print("[*] Using pf (Packet Filter) backend.")
+def fetch_networks(primary: str, secondary: list, allow: list) -> dict:
+    found = {4: [], 6: []}
+    skipped = 0
+    for i, src in enumerate([primary] + secondary):
+        print(f"[*] Loading {'primary' if i == 0 else 'secondary'} list: {src}")
+        try:
+            part, s = parse_feed(read_source(src), allow)
+        except (URLError, OSError, RuntimeError, ValueError) as e:
+            if i == 0:
+                raise                      # primary list is required
+            print(f"[!] Skipping secondary list: {e}", file=sys.stderr)
+            continue
+        for v in (4, 6):
+            found[v].extend(part[v])
+        skipped += s
+        print(f"    {len(part[4]) + len(part[6])} usable entries")
 
-    table_file = "/etc/pf.minescan_blocklist.conf"
-    anchor_file = "/etc/pf.anchors/minescan"
+    # Merge overlapping/duplicate entries across all lists.
+    nets = {v: sorted(ipaddress.collapse_addresses(found[v])) for v in (4, 6)}
+    if not (nets[4] or nets[6]):
+        raise RuntimeError("No valid entries found in the downloaded feed(s).")
+    print(f"[*] Total after merging: {len(nets[4])} IPv4 + {len(nets[6])} IPv6 entries "
+          f"({skipped} lines skipped: invalid, private, too broad or allow-listed).")
+    return nets
 
-    with open(table_file, "w") as f:
-        f.write("\n".join(ips) + "\n")
 
-    anchor_rules = (
-        f'table <minescan_blocklist> persist file "{table_file}"\n'
-        f'block drop in quick proto tcp from <minescan_blocklist> to any port {port}\n'
+# --------------------------------------------------------------------------- #
+# Linux: nftables
+# --------------------------------------------------------------------------- #
+def nft_set(name: str, addr_type: str, nets: list) -> str:
+    elems = f" elements = {{ {', '.join(map(str, nets))} }}" if nets else ""
+    return f"    set {name} {{ type {addr_type}; flags interval; auto-merge;{elems} }}\n"
+
+
+def nft_apply(nets: dict, port: int):
+    print("[*] Using nftables backend.")
+    # Hooking prerouting (priority raw) also covers traffic to Docker-published
+    # ports, which never reaches the INPUT chain.
+    script = (
+        f"table inet {NFT_TABLE}\n"          # ensures it exists so delete can't fail
+        f"delete table inet {NFT_TABLE}\n"
+        f"table inet {NFT_TABLE} {{\n"
+        + nft_set("blocked4", "ipv4_addr", nets[4])
+        + nft_set("blocked6", "ipv6_addr", nets[6])
+        + "    chain prerouting {\n"
+        "        type filter hook prerouting priority raw; policy accept;\n"
+        f"        tcp dport {port} ip saddr @blocked4 drop\n"
+        f"        tcp dport {port} ip6 saddr @blocked6 drop\n"
+        "    }\n"
+        "}\n"
     )
-    with open(anchor_file, "w") as f:
-        f.write(anchor_rules)
+    run(["nft", "-f", "-"], input_text=script)   # applied atomically
+    print(f"[+] Dropping tcp/{port} from {len(nets[4]) + len(nets[6])} entries.")
+    print("    Not persistent across reboots: re-run this script at boot "
+          "(systemd timer/cron), or include the table in your nftables config.")
 
-    pf_conf = "/etc/pf.conf"
-    with open(pf_conf, "r") as f:
+
+def nft_remove():
+    run(["nft", "delete", "table", "inet", NFT_TABLE], check=False)
+
+
+# --------------------------------------------------------------------------- #
+# Linux: ipset + iptables fallback
+# --------------------------------------------------------------------------- #
+IPSET_FAMILIES = ((4, "iptables", "inet"), (6, "ip6tables", "inet6"))
+
+
+def ipset_rule(tool: str, name: str, port: int, action: str) -> list[str]:
+    return [tool, "-t", "raw", action, "PREROUTING", "-p", "tcp", "--dport", str(port),
+            "-m", "set", "--match-set", name, "src", "-j", "DROP"]
+
+
+def ipset_apply(nets: dict, port: int):
+    print("[*] Using ipset + iptables backend.")
+    for ver, tool, family in IPSET_FAMILIES:
+        if not nets[ver]:
+            continue
+        if not which(tool):
+            print(f"[!] {tool} not found; skipping IPv{ver} entries.", file=sys.stderr)
+            continue
+        name = f"{SET_NAME}_v{ver}"
+        tmp = name + "_tmp"
+        spec = f"hash:net family {family} maxelem {IPSET_MAXELEM}"
+        lines = [f"create {tmp} {spec} -exist", f"flush {tmp}"]
+        lines += [f"add {tmp} {n}" for n in nets[ver]]
+        lines += [f"create {name} {spec} -exist", f"swap {tmp} {name}", f"destroy {tmp}"]
+        run(["ipset", "restore", "-exist"], input_text="\n".join(lines) + "\n")
+
+        if run(ipset_rule(tool, name, port, "-C"), check=False).returncode != 0:
+            run(ipset_rule(tool, name, port, "-I"))
+        print(f"[+] IPv{ver}: {len(nets[ver])} entries, DROP on tcp/{port}.")
+    print("    Not persistent across reboots: re-run this script at boot, or use "
+          "ipset-persistent / netfilter-persistent.")
+
+
+def ipset_remove(port: int):
+    for ver, tool, _ in IPSET_FAMILIES:
+        name = f"{SET_NAME}_v{ver}"
+        if which(tool):
+            while run(ipset_rule(tool, name, port, "-D"), check=False).returncode == 0:
+                pass
+        if which("ipset"):
+            run(["ipset", "destroy", name], check=False)
+
+
+def linux_apply(nets: dict, port: int):
+    if which("nft"):
+        nft_apply(nets, port)
+    elif which("ipset") and which("iptables"):
+        ipset_apply(nets, port)
+    else:
+        raise RuntimeError("Neither nft nor ipset+iptables found. Install nftables.")
+
+
+def linux_remove(port: int):
+    if which("nft"):
+        nft_remove()
+    if which("ipset"):
+        ipset_remove(port)
+    print("[+] Removed.")
+
+
+# --------------------------------------------------------------------------- #
+# macOS: pf
+# --------------------------------------------------------------------------- #
+PF_CONF = "/etc/pf.conf"
+PF_ANCHOR_FILE = f"/etc/pf.anchors/{PF_ANCHOR}"
+PF_TABLE_FILE = f"/etc/pf.{PF_ANCHOR}_blocklist.txt"
+PF_LINES = (f'anchor "{PF_ANCHOR}"', f'load anchor "{PF_ANCHOR}" from "{PF_ANCHOR_FILE}"')
+
+
+def pf_apply(nets: dict, port: int):
+    print("[*] Using pf backend.")
+    entries = [str(n) for v in (4, 6) for n in nets[v]]
+    write_file(PF_TABLE_FILE, "\n".join(entries) + "\n")
+    write_file(PF_ANCHOR_FILE,
+               f'table <{PF_ANCHOR}_blocklist> persist file "{PF_TABLE_FILE}"\n'
+               f"block drop in quick proto tcp from <{PF_ANCHOR}_blocklist> "
+               f"to any port {port}\n")
+
+    with open(PF_CONF) as f:
         contents = f.read()
+    if PF_LINES[0] not in contents:
+        shutil.copy2(PF_CONF, PF_CONF + ".bak")
+        write_file(PF_CONF, contents.rstrip("\n") + "\n" + "\n".join(PF_LINES) + "\n")
+        print(f"[*] Registered anchor in {PF_CONF} (backup: {PF_CONF}.bak).")
 
-    anchor_line = 'anchor "minescan"'
-    load_line = f'load anchor "minescan" from "{anchor_file}"'
-
-    if anchor_line not in contents:
-        with open(pf_conf, "a") as f:
-            f.write(f'\n{anchor_line}\n{load_line}\n')
-        print(f"[*] Registered anchor in {pf_conf}.")
-
-    run(["pfctl", "-f", pf_conf])
-    run(["pfctl", "-e"], check=False)
-
-    print(f"[+] pf table 'minescan_blocklist' updated with {len(ips)} IPs; "
-          f"drop rule active on tcp/{port}.")
-    print("    Note: macOS's Application Firewall (System Settings) is separate "
-          "from pf and only controls inbound app-level access, not IP/port "
-          "blocking, so pf is the correct layer here.")
+    run(["pfctl", "-a", PF_ANCHOR, "-f", PF_ANCHOR_FILE])
+    run(["pfctl", "-e"], check=False)   # fails harmlessly if already enabled
+    print(f"[+] Dropping tcp/{port} from {len(entries)} entries.")
 
 
-def block_windows(ips: list[str], port: int):
-    print("[*] Using Windows Firewall backend (PowerShell).")
-    batch_size = 200
-    remove_cmd = (
-        f'Get-NetFirewallRule -DisplayName "{RULE_NAME}_*" -ErrorAction SilentlyContinue '
-        f'| Remove-NetFirewallRule'
-    )
-    subprocess.run(["powershell", "-NoProfile", "-Command", remove_cmd],
-                    capture_output=True, text=True)
+def pf_remove():
+    run(["pfctl", "-a", PF_ANCHOR, "-F", "all"], check=False)
+    if os.path.exists(PF_CONF):
+        with open(PF_CONF) as f:
+            kept = [l for l in f.read().splitlines() if l.strip() not in PF_LINES]
+        write_file(PF_CONF, "\n".join(kept) + "\n")
+    for path in (PF_ANCHOR_FILE, PF_TABLE_FILE):
+        if os.path.exists(path):
+            os.remove(path)
+    print("[+] Removed.")
 
-    batches = [ips[i:i + batch_size] for i in range(0, len(ips), batch_size)]
+
+# --------------------------------------------------------------------------- #
+# Windows Firewall
+# --------------------------------------------------------------------------- #
+def powershell(cmd: str, check=True):
+    return run(["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd], check=check)
+
+
+def windows_remove():
+    powershell(f"Get-NetFirewallRule -DisplayName '{RULE_NAME}_*' "
+               f"-ErrorAction SilentlyContinue | Remove-NetFirewallRule", check=False)
+
+
+def windows_apply(nets: dict, port: int):
+    print("[*] Using Windows Firewall backend.")
+    addrs = [str(n) for v in (4, 6) for n in nets[v]]
+    windows_remove()
+    batches = [addrs[i:i + WIN_BATCH] for i in range(0, len(addrs), WIN_BATCH)]
     for idx, batch in enumerate(batches, start=1):
-        addr_list = ",".join(batch)
-        rule_name = f"{RULE_NAME}_{idx}"
-        cmd = (
-            f'New-NetFirewallRule -DisplayName "{rule_name}" -Direction Inbound '
-            f'-Action Block -Protocol TCP -LocalPort {port} '
-            f'-RemoteAddress {addr_list} -Profile Any'
+        remote = ",".join(f"'{a}'" for a in batch)
+        powershell(
+            f"New-NetFirewallRule -DisplayName '{RULE_NAME}_{idx}' -Direction Inbound "
+            f"-Action Block -Protocol TCP -LocalPort {port} "
+            f"-RemoteAddress @({remote}) -Profile Any"
         )
-        result = subprocess.run(["powershell", "-NoProfile", "-Command", cmd],
-                                 capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"Failed to create rule {rule_name}:\n{result.stderr}")
+    print(f"[+] Created {len(batches)} rule(s) covering {len(addrs)} entries on tcp/{port}.")
 
-    print(f"[+] Created {len(batches)} Windows Firewall rule(s) covering "
-          f"{len(ips)} IPs; inbound TCP/{port} blocked from those addresses.")
+
+# --------------------------------------------------------------------------- #
+# main
+# --------------------------------------------------------------------------- #
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--port", type=int, default=DEFAULT_PORT,
+                   help=f"TCP port to protect (default: {DEFAULT_PORT})")
+    p.add_argument("--url", default=DEFAULT_URL, help="Feed URL (one IP or CIDR per line)")
+    p.add_argument("--secondary", action="append", default=[], metavar="URL|FILE",
+                   help="Additional list (URL or local file, one IP/CIDR per line); "
+                        "merged with the primary list. Repeatable. If it can't be "
+                        "loaded it is skipped with a warning.")
+    p.add_argument("--allow", action="append", default=[], metavar="CIDR",
+                   help="Never block entries overlapping this IP/CIDR (repeatable)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Download and parse only; don't touch the firewall (no root needed)")
+    p.add_argument("--remove", action="store_true",
+                   help="Remove the rules and block list installed by this script")
+    args = p.parse_args()
+
+    if not 1 <= args.port <= 65535:
+        p.error("--port must be between 1 and 65535")
+    try:
+        args.allow = [ipaddress.ip_network(a, strict=False) for a in args.allow]
+    except ValueError as e:
+        p.error(f"invalid --allow value: {e}")
+    return args
+
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT,
-                         help=f"Port to block (default: {DEFAULT_PORT})")
-    parser.add_argument("--url", default=DEFAULT_URL,
-                         help="Feed URL returning one IP per line")
-    parser.add_argument("--dry-run", action="store_true",
-                         help="Fetch and parse the list without touching the firewall")
-    args = parser.parse_args()
-
-    if not is_admin():
-        print("[!] This script must be run with administrator/root privileges.",
-              file=sys.stderr)
-        sys.exit(1)
-
-    ips = fetch_ip_list(args.url)
-
-    if args.dry_run:
-        print(f"[dry-run] Would block {len(ips)} IPs on port {args.port}.")
-        return
-
+    args = parse_args()
     system = platform.system()
-    if system == "Linux":
-        block_linux(ips, args.port)
-    elif system == "Darwin":
-        block_macos_pf(ips, args.port)
-    elif system == "Windows":
-        block_windows(ips, args.port)
-    else:
-        raise RuntimeError(f"Unsupported OS: {system}")
+    if system not in ("Linux", "Darwin", "Windows"):
+        sys.exit(f"Unsupported OS: {system}")
+
+    if not args.dry_run and not is_admin():
+        sys.exit("[!] Run with administrator/root privileges (or use --dry-run).")
+
+    try:
+        if args.remove:
+            {"Linux": lambda: linux_remove(args.port),
+             "Darwin": pf_remove,
+             "Windows": lambda: (windows_remove(), print("[+] Removed."))}[system]()
+            return
+
+        nets = fetch_networks(args.url, args.secondary, args.allow)
+        if args.dry_run:
+            print(f"[dry-run] Would block {len(nets[4]) + len(nets[6])} entries "
+                  f"on tcp/{args.port}.")
+            return
+
+        {"Linux": linux_apply, "Darwin": pf_apply, "Windows": windows_apply}[system](
+            nets, args.port)
+    except (RuntimeError, URLError, OSError, ValueError) as e:
+        sys.exit(f"[!] {e}")
 
 
 if __name__ == "__main__":
