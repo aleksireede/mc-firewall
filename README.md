@@ -8,6 +8,8 @@ Run the script with **Administrator** or **root** privileges:
 
 * **Linux / macOS:**
 ```bash
+wget -O mc-firewall.py https://raw.githubusercontent.com/aleksireede/mc-firewall/refs/heads/main/main.py
+chmod +x mc-firewall.py
 sudo python3 main.py
 
 ```
