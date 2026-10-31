@@ -23,11 +23,14 @@ import platform
 import shutil
 import subprocess
 import sys
+import urllib.parse
 import urllib.request
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 DEFAULT_URL = "https://data.minescan.xyz/scanners/export?format=ip&includeMinescan=true"
 DEFAULT_PORT = 25565
+DEFAULT_LIMIT = 50000   # the Minescan feed returns only 1000 entries unless "limit" is set
+SERVER_DEFAULT_CAP = 1000
 USER_AGENT = "mc-firewall/2.0"
 
 SET_NAME = "minescan_blocklist"   # ipset base name (suffixed _v4 / _v6)
@@ -117,13 +120,45 @@ def read_source(src: str) -> str:
     return raw.decode("utf-8", errors="ignore")
 
 
-def fetch_networks(primary: str, secondary: list, allow: list) -> dict:
+def with_limit(src: str, limit: int) -> str:
+    """Add ?limit=N to an http(s) URL unless it already has one."""
+    if not limit or os.path.isfile(src):
+        return src
+    parts = urllib.parse.urlsplit(src)
+    query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    if any(k == "limit" for k, _ in query):
+        return src
+    query.append(("limit", str(limit)))
+    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
+
+
+def load_list(src: str, limit: int) -> str:
+    url = with_limit(src, limit)
+    try:
+        text = read_source(url)
+    except HTTPError as e:
+        if url == src or e.code not in (400, 413, 422):
+            raise
+        print(f"[!] Server rejected limit={limit} (HTTP {e.code}); retrying without it. "
+              f"The list may be capped.", file=sys.stderr)
+        url, text = src, read_source(src)
+
+    count = sum(1 for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#"))
+    cap = limit if url != src else SERVER_DEFAULT_CAP
+    if src.lower().startswith(("http://", "https://")) and count >= cap:
+        print(f"[!] Received exactly {count} entries - the list is probably truncated. "
+              f"Raise --limit.", file=sys.stderr)
+    return text
+
+
+def fetch_networks(primary: str, secondary: list, allow: list, limit: int) -> dict:
     found = {4: [], 6: []}
     skipped = 0
     for i, src in enumerate([primary] + secondary):
         print(f"[*] Loading {'primary' if i == 0 else 'secondary'} list: {src}")
         try:
-            part, s = parse_feed(read_source(src), allow)
+            # --limit only applies to the primary feed; secondary sources are used as given.
+            part, s = parse_feed(load_list(src, limit if i == 0 else 0), allow)
         except (URLError, OSError, RuntimeError, ValueError) as e:
             if i == 0:
                 raise                      # primary list is required
@@ -317,6 +352,10 @@ def parse_args():
     p.add_argument("--port", type=int, default=DEFAULT_PORT,
                    help=f"TCP port to protect (default: {DEFAULT_PORT})")
     p.add_argument("--url", default=DEFAULT_URL, help="Feed URL (one IP or CIDR per line)")
+    p.add_argument("--limit", type=int, default=DEFAULT_LIMIT,
+                   help=f"Max entries to request from the primary feed (default: {DEFAULT_LIMIT}). "
+                        f"The Minescan API returns only {SERVER_DEFAULT_CAP} without it. "
+                        f"0 = don't send a limit.")
     p.add_argument("--secondary", action="append", default=[], metavar="URL|FILE",
                    help="Additional list (URL or local file, one IP/CIDR per line); "
                         "merged with the primary list. Repeatable. If it can't be "
@@ -331,6 +370,8 @@ def parse_args():
 
     if not 1 <= args.port <= 65535:
         p.error("--port must be between 1 and 65535")
+    if args.limit < 0:
+        p.error("--limit must be 0 or greater")
     try:
         args.allow = [ipaddress.ip_network(a, strict=False) for a in args.allow]
     except ValueError as e:
@@ -354,7 +395,7 @@ def main():
              "Windows": lambda: (windows_remove(), print("[+] Removed."))}[system]()
             return
 
-        nets = fetch_networks(args.url, args.secondary, args.allow)
+        nets = fetch_networks(args.url, args.secondary, args.allow, args.limit)
         if args.dry_run:
             print(f"[dry-run] Would block {len(nets[4]) + len(nets[6])} entries "
                   f"on tcp/{args.port}.")
