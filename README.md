@@ -106,6 +106,30 @@ A daily run stays well within the Minescan rate limits.
 
 ---
 
+## Making your own list
+
+Download the minescan list, add it to your list and sort(removes duplicated)
+
+**Example includes my gitlab snippet list**
+* **Linux/Macos**
+```bash
+wget -qO- 'https://data.minescan.xyz/scanners/export?format=ip&includeMinescan=true&limit=5000' > ips.txt
+wget -qO- 'https://gitlab.com/-/snippets/6073805/raw/main/snippetfile1.txt' >> ips.txt
+
+sort -u -t. -k1,1n -k2,2n -k3,3n -k4,4n ips.txt > ips_sorted.txt
+```
+
+* **Windows powershell**
+```powershell
+$a = (Invoke-WebRequest 'https://data.minescan.xyz/scanners/export?format=ip&includeMinescan=true&limit=5000').Content -split "`r?`n"
+$b = (Invoke-WebRequest 'https://gitlab.com/-/snippets/6073805/raw/main/snippetfile1.txt').Content -split "`r?`n"
+($a + $b) | ForEach-Object { $_.Trim() } |
+  Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' } |
+  Sort-Object -Unique { [version]$_ } | Set-Content ips_all.txt
+
+Get-Content ips_all.txt | Where-Object { $_.Trim() } | Sort-Object -Unique { [version]$_.Trim() } | Set-Content ips_sorted.txt
+```
+
 ## Requirements & Compatibility
 
 **Python:** 3.7+ (no external `pip` packages needed).
