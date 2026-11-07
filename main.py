@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Block Minescan scanner IPs from reaching a Minecraft server port.
+"""Block Minescan scanner IPs from reaching the server.
 
 Downloads the Minescan feed (IPs and/or CIDR ranges) and installs a drop rule
-for the given TCP port using nftables or ipset+iptables (Linux), pf (macOS)
-or Windows Firewall.
+for all inbound traffic from matching addresses using nftables or
+ipset+iptables (Linux), pf (macOS) or Windows Firewall.
 
 The script is idempotent: re-running it (cron / systemd timer) replaces the
 block list in place without duplicating rules.
 
 Examples:
     sudo ./mc-firewall.py --dry-run
-    sudo ./mc-firewall.py --port 25565 --allow 203.0.113.0/24
+    sudo ./mc-firewall.py --allow 203.0.113.0/24
     sudo ./mc-firewall.py --secondary https://example.com/list.txt --secondary extra.txt
     sudo ./mc-firewall.py --remove
 """
@@ -27,7 +27,7 @@ import urllib.parse
 import urllib.request
 from urllib.error import HTTPError, URLError
 
-DEFAULT_URL = "https://data.minescan.xyz/scanners/export?format=ip&includeMinescan=true"
+DEFAULT_URL = "https://gitlab.com/-/snippets/6073805/raw/main/snippetfile1.txt" # ORIGINAL:"https://data.minescan.xyz/scanners/export?format=ip&includeMinescan=true"
 DEFAULT_PORT = 25565
 DEFAULT_LIMIT = 50000   # the Minescan feed returns only 1000 entries unless "limit" is set
 SERVER_DEFAULT_CAP = 1000
@@ -186,7 +186,7 @@ def nft_set(name: str, addr_type: str, nets: list) -> str:
     return f"    set {name} {{ type {addr_type}; flags interval; auto-merge;{elems} }}\n"
 
 
-def nft_apply(nets: dict, port: int):
+def nft_apply(nets: dict):
     print("[*] Using nftables backend.")
     # Hooking prerouting (priority raw) also covers traffic to Docker-published
     # ports, which never reaches the INPUT chain.
@@ -198,13 +198,14 @@ def nft_apply(nets: dict, port: int):
         + nft_set("blocked6", "ipv6_addr", nets[6])
         + "    chain prerouting {\n"
         "        type filter hook prerouting priority raw; policy accept;\n"
-        f"        tcp dport {port} ip saddr @blocked4 drop\n"
-        f"        tcp dport {port} ip6 saddr @blocked6 drop\n"
+        "        ip saddr @blocked4 drop\n"
+        "        ip6 saddr @blocked6 drop\n"
         "    }\n"
         "}\n"
     )
     run(["nft", "-f", "-"], input_text=script)   # applied atomically
-    print(f"[+] Dropping tcp/{port} from {len(nets[4]) + len(nets[6])} entries.")
+    print(f"[+] Dropping all inbound traffic from "
+          f"{len(nets[4]) + len(nets[6])} entries.")
     print("    Not persistent across reboots: re-run this script at boot "
           "(systemd timer/cron), or include the table in your nftables config.")
 
@@ -219,12 +220,17 @@ def nft_remove():
 IPSET_FAMILIES = ((4, "iptables", "inet"), (6, "ip6tables", "inet6"))
 
 
-def ipset_rule(tool: str, name: str, port: int, action: str) -> list[str]:
+def ipset_rule(tool: str, name: str, action: str) -> list[str]:
+    return [tool, "-t", "raw", action, "PREROUTING",
+            "-m", "set", "--match-set", name, "src", "-j", "DROP"]
+
+
+def ipset_legacy_rule(tool: str, name: str, port: int, action: str) -> list[str]:
     return [tool, "-t", "raw", action, "PREROUTING", "-p", "tcp", "--dport", str(port),
             "-m", "set", "--match-set", name, "src", "-j", "DROP"]
 
 
-def ipset_apply(nets: dict, port: int):
+def ipset_apply(nets: dict):
     print("[*] Using ipset + iptables backend.")
     for ver, tool, family in IPSET_FAMILIES:
         if not nets[ver]:
@@ -240,9 +246,9 @@ def ipset_apply(nets: dict, port: int):
         lines += [f"create {name} {spec} -exist", f"swap {tmp} {name}", f"destroy {tmp}"]
         run(["ipset", "restore", "-exist"], input_text="\n".join(lines) + "\n")
 
-        if run(ipset_rule(tool, name, port, "-C"), check=False).returncode != 0:
-            run(ipset_rule(tool, name, port, "-I"))
-        print(f"[+] IPv{ver}: {len(nets[ver])} entries, DROP on tcp/{port}.")
+        if run(ipset_rule(tool, name, "-C"), check=False).returncode != 0:
+            run(ipset_rule(tool, name, "-I"))
+        print(f"[+] IPv{ver}: {len(nets[ver])} entries, dropping all inbound traffic.")
     print("    Not persistent across reboots: re-run this script at boot, or use "
           "ipset-persistent / netfilter-persistent.")
 
@@ -251,17 +257,19 @@ def ipset_remove(port: int):
     for ver, tool, _ in IPSET_FAMILIES:
         name = f"{SET_NAME}_v{ver}"
         if which(tool):
-            while run(ipset_rule(tool, name, port, "-D"), check=False).returncode == 0:
+            while run(ipset_rule(tool, name, "-D"), check=False).returncode == 0:
+                pass
+            while run(ipset_legacy_rule(tool, name, port, "-D"), check=False).returncode == 0:
                 pass
         if which("ipset"):
             run(["ipset", "destroy", name], check=False)
 
 
-def linux_apply(nets: dict, port: int):
+def linux_apply(nets: dict):
     if which("nft"):
-        nft_apply(nets, port)
+        nft_apply(nets)
     elif which("ipset") and which("iptables"):
-        ipset_apply(nets, port)
+        ipset_apply(nets)
     else:
         raise RuntimeError("Neither nft nor ipset+iptables found. Install nftables.")
 
@@ -283,14 +291,13 @@ PF_TABLE_FILE = f"/etc/pf.{PF_ANCHOR}_blocklist.txt"
 PF_LINES = (f'anchor "{PF_ANCHOR}"', f'load anchor "{PF_ANCHOR}" from "{PF_ANCHOR_FILE}"')
 
 
-def pf_apply(nets: dict, port: int):
+def pf_apply(nets: dict):
     print("[*] Using pf backend.")
     entries = [str(n) for v in (4, 6) for n in nets[v]]
     write_file(PF_TABLE_FILE, "\n".join(entries) + "\n")
     write_file(PF_ANCHOR_FILE,
                f'table <{PF_ANCHOR}_blocklist> persist file "{PF_TABLE_FILE}"\n'
-               f"block drop in quick proto tcp from <{PF_ANCHOR}_blocklist> "
-               f"to any port {port}\n")
+               f"block drop in quick from <{PF_ANCHOR}_blocklist> to any\n")
 
     with open(PF_CONF) as f:
         contents = f.read()
@@ -301,7 +308,7 @@ def pf_apply(nets: dict, port: int):
 
     run(["pfctl", "-a", PF_ANCHOR, "-f", PF_ANCHOR_FILE])
     run(["pfctl", "-e"], check=False)   # fails harmlessly if already enabled
-    print(f"[+] Dropping tcp/{port} from {len(entries)} entries.")
+    print(f"[+] Dropping all inbound traffic from {len(entries)} entries.")
 
 
 def pf_remove():
@@ -328,7 +335,7 @@ def windows_remove():
                f"-ErrorAction SilentlyContinue | Remove-NetFirewallRule", check=False)
 
 
-def windows_apply(nets: dict, port: int):
+def windows_apply(nets: dict):
     print("[*] Using Windows Firewall backend.")
     addrs = [str(n) for v in (4, 6) for n in nets[v]]
     windows_remove()
@@ -337,10 +344,10 @@ def windows_apply(nets: dict, port: int):
         remote = ",".join(f"'{a}'" for a in batch)
         powershell(
             f"New-NetFirewallRule -DisplayName '{RULE_NAME}_{idx}' -Direction Inbound "
-            f"-Action Block -Protocol TCP -LocalPort {port} "
-            f"-RemoteAddress @({remote}) -Profile Any"
+            f"-Action Block -Protocol Any -RemoteAddress @({remote}) -Profile Any"
         )
-    print(f"[+] Created {len(batches)} rule(s) covering {len(addrs)} entries on tcp/{port}.")
+    print(f"[+] Created {len(batches)} rule(s) covering {len(addrs)} entries "
+          "for all inbound traffic.")
 
 
 # --------------------------------------------------------------------------- #
@@ -350,7 +357,7 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--port", type=int, default=DEFAULT_PORT,
-                   help=f"TCP port to protect (default: {DEFAULT_PORT})")
+                   help="Legacy port used only to remove older Linux port-specific rules")
     p.add_argument("--url", default=DEFAULT_URL, help="Feed URL (one IP or CIDR per line)")
     p.add_argument("--limit", type=int, default=DEFAULT_LIMIT,
                    help=f"Max entries to request from the primary feed (default: {DEFAULT_LIMIT}). "
@@ -397,12 +404,11 @@ def main():
 
         nets = fetch_networks(args.url, args.secondary, args.allow, args.limit)
         if args.dry_run:
-            print(f"[dry-run] Would block {len(nets[4]) + len(nets[6])} entries "
-                  f"on tcp/{args.port}.")
+            print(f"[dry-run] Would block all inbound traffic from "
+                  f"{len(nets[4]) + len(nets[6])} entries.")
             return
 
-        {"Linux": linux_apply, "Darwin": pf_apply, "Windows": windows_apply}[system](
-            nets, args.port)
+        {"Linux": linux_apply, "Darwin": pf_apply, "Windows": windows_apply}[system](nets)
     except (RuntimeError, URLError, OSError, ValueError) as e:
         sys.exit(f"[!] {e}")
 
